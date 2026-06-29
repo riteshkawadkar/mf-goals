@@ -1,0 +1,656 @@
+openapi: 3.0.3
+info:
+  title: Goal-Based MF Tracker API
+  version: 1.0.0
+  description: >
+    Frozen API contract for the goal-based mutual fund tracker.
+    The FastAPI/Python backend (built with Claude Code) implements these endpoints
+    and owns its own PostgreSQL database (not Supabase).
+    The React web frontend (built with Lovable) consumes them and must NOT generate
+    engine logic or reasoning text of its own — it renders what the backend returns.
+
+    Invariants baked into this contract:
+      - All financial reasoning is computed server-side and returned as reasoning_objects.
+      - Outputs are descriptive, never prescriptive (no buy/sell, no fund recommendations).
+      - Projections are always p10/p50/p90, never a single number.
+      - Portfolio health is returned separately from and ahead of per-goal status.
+
+servers:
+  - url: https://api.your-domain.com
+    description: Production backend (deploy via Render/Railway/Fly)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Ingestion
+  - name: Goals
+  - name: Assumptions
+  - name: Engine
+  - name: Earmarks
+  - name: Chat
+
+paths:
+  /cas/upload:
+    post:
+      tags: [Ingestion]
+      summary: Upload a CAS PDF for parsing
+      description: >
+        Parses the detailed CAS, extracts holdings + tax-lots, classifies transaction
+        types, reconstructs STPs, then DELETES the PDF (parse-and-discard). Returns
+        imported holdings plus DETECTED (not yet confirmed) recurring SIPs for the user
+        to confirm via /sips/confirm.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The detailed CAS PDF (full transaction history required).
+                password:
+                  type: string
+                  description: CAS PDF password (not stored).
+      responses:
+        '200':
+          description: Parse succeeded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  holdings_imported: { type: integer }
+                  tax_lots_imported: { type: integer }
+                  holdings:
+                    type: array
+                    items: { $ref: '#/components/schemas/Holding' }
+                  detected_sips:
+                    type: array
+                    items: { $ref: '#/components/schemas/DetectedSip' }
+        '422':
+          description: Could not parse (wrong/modified PDF, summary instead of detailed, bad password)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /holdings:
+    get:
+      tags: [Ingestion]
+      summary: List current holdings with tax-lots and live valuation
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Holding' }
+
+  /sips:
+    get:
+      tags: [Ingestion]
+      summary: List confirmed active SIPs
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ActiveSip' }
+
+  /sips/confirm:
+    post:
+      tags: [Ingestion]
+      summary: Confirm/edit ongoing SIPs (the future-contribution input)
+      description: >
+        Ongoing SIP is a CONFIRMED USER INPUT; the CAS only seeds the suggestion.
+        This endpoint records the user-confirmed active-SIP list that drives the
+        sufficiency projection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sips]
+              properties:
+                sips:
+                  type: array
+                  items: { $ref: '#/components/schemas/ActiveSipInput' }
+      responses:
+        '200':
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ActiveSip' }
+
+  /goals:
+    get:
+      tags: [Goals]
+      summary: List goals
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Goal' }
+    post:
+      tags: [Goals]
+      summary: Create a goal (characterization runs server-side)
+      description: >
+        Client sends archetype + target_today + horizon + priority. Server derives
+        target_future_value (inflation), equity band, glide_start_date, and the
+        confidence_tag (high/medium/low). Does not run the full engine — call /engine/run after.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoalInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Goal' }
+
+  /goals/{goalId}:
+    patch:
+      tags: [Goals]
+      summary: Update a goal
+      parameters:
+        - $ref: '#/components/parameters/GoalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoalInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Goal' }
+    delete:
+      tags: [Goals]
+      summary: Delete a goal
+      parameters:
+        - $ref: '#/components/parameters/GoalId'
+      responses:
+        '204':
+          description: Deleted
+
+  /assumptions:
+    get:
+      tags: [Assumptions]
+      summary: Get assumption set (bands, inflation, mu/sigma, stress library)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Assumption' }
+    patch:
+      tags: [Assumptions]
+      summary: Edit assumptions (does NOT auto-run engine; call /engine/run after)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assumptions]
+              properties:
+                assumptions:
+                  type: array
+                  items: { $ref: '#/components/schemas/AssumptionInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Assumption' }
+
+  /engine/run:
+    post:
+      tags: [Engine]
+      summary: Run the full engine (Layers 0-3) and persist results
+      description: >
+        Computes Portfolio Health, characterization, most-constrained-first earmarking,
+        and the three diagnoses, generating a reasoning_object for every output.
+        Returns the complete computed state (same shape as GET /dashboard).
+      responses:
+        '200':
+          description: Computed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardState' }
+
+  /dashboard:
+    get:
+      tags: [Engine]
+      summary: Get the last computed state for rendering (no recompute)
+      description: >
+        The render endpoint for the web UI. Returns portfolio health,
+        per-goal status with earmarks + diagnoses, the unallocated bucket, and all
+        reasoning objects. Ordering convention for UI - portfolio_health first.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardState' }
+
+  /earmarks/{earmarkId}:
+    patch:
+      tags: [Earmarks]
+      summary: User adjusts or locks an earmark
+      description: >
+        Setting locked=true pins this earmark; the engine will allocate AROUND it and
+        never override it on future runs. Adjusting percentage triggers re-reconciliation
+        so each holding still sums to 100% (remainder to Unallocated).
+      parameters:
+        - name: earmarkId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                percentage:
+                  type: number
+                  minimum: 0
+                  maximum: 100
+                locked:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated and re-reconciled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardState' }
+
+  /chat:
+    post:
+      tags: [Chat]
+      summary: Ask the scoped, grounded "why" chatbot
+      description: >
+        Answers ONLY from this user's stored reasoning_objects and engine outputs.
+        Out-of-scope queries (stock tips, tax filing, general markets) are refused.
+        Never emits buy/sell directives. If the engine did not compute something,
+        the bot says so rather than inventing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+                subject_ref:
+                  type: string
+                  description: >
+                    Optional. The id of the goal/holding/earmark/flag the question is
+                    about (e.g. when the user taps "why?" on a specific card).
+      responses:
+        '200':
+          description: Answer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatResponse' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Backend-issued JWT (FastAPI owns auth).
+
+  parameters:
+    GoalId:
+      name: goalId
+      in: path
+      required: true
+      schema: { type: string }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+
+    Holding:
+      type: object
+      properties:
+        id: { type: string }
+        scheme_code: { type: string }
+        scheme_name: { type: string }
+        amc: { type: string }
+        category: { type: string, description: "AMFI category, e.g. Flexi Cap, Small Cap, Liquid" }
+        asset_class:
+          type: string
+          enum: [liquid, debt, hybrid, equity]
+        equity_fraction: { type: number, description: "0.0-1.0" }
+        style_cluster_id: { type: string, description: "For style-overlap detection" }
+        sector_tags:
+          type: array
+          items: { type: string }
+        current_units: { type: number }
+        current_nav: { type: number }
+        current_value: { type: number }
+        tax_lots:
+          type: array
+          items: { $ref: '#/components/schemas/TaxLot' }
+
+    TaxLot:
+      type: object
+      properties:
+        id: { type: string }
+        holding_id: { type: string }
+        units: { type: number }
+        nav_at_buy: { type: number }
+        cost_basis: { type: number }
+        buy_date: { type: string, format: date }
+        lock_until:
+          type: string
+          format: date
+          nullable: true
+          description: "ELSS unlock date for THIS lot (lot-wise, not scheme-wise). Null if unlocked."
+        gain_type:
+          type: string
+          enum: [stcg, ltcg, locked]
+
+    DetectedSip:
+      type: object
+      description: A recurring purchase pattern found in the CAS, pending user confirmation.
+      properties:
+        scheme_code: { type: string }
+        scheme_name: { type: string }
+        suggested_amount: { type: number }
+        cadence:
+          type: string
+          enum: [monthly, quarterly]
+        last_installment_date: { type: string, format: date }
+        detection_confidence:
+          type: string
+          enum: [high, medium, low]
+
+    ActiveSipInput:
+      type: object
+      required: [scheme_code, amount, cadence]
+      properties:
+        scheme_code: { type: string }
+        amount: { type: number }
+        cadence:
+          type: string
+          enum: [monthly, quarterly]
+        run_until:
+          type: string
+          format: date
+          nullable: true
+
+    ActiveSip:
+      allOf:
+        - $ref: '#/components/schemas/ActiveSipInput'
+        - type: object
+          properties:
+            id: { type: string }
+            source:
+              type: string
+              enum: [detected, confirmed]
+
+    GoalInput:
+      type: object
+      required: [name, archetype]
+      properties:
+        name: { type: string }
+        archetype:
+          type: string
+          enum: [emergency, near_term_fixed, education, retirement, perpetual_wealth, recurring_liability]
+        target_today:
+          type: number
+          nullable: true
+          description: "Cost in today's money. Null for perpetual_wealth (no target)."
+        horizon_date:
+          type: string
+          format: date
+          nullable: true
+          description: "Null for emergency and perpetual_wealth."
+        priority: { type: integer, description: "1 = highest" }
+        inflation_rate:
+          type: number
+          nullable: true
+          description: "Optional override; server defaults by archetype if omitted."
+
+    Goal:
+      type: object
+      description: Server-characterized goal. Derived fields are computed, not client-set.
+      properties:
+        id: { type: string }
+        name: { type: string }
+        archetype:
+          type: string
+          enum: [emergency, near_term_fixed, education, retirement, perpetual_wealth, recurring_liability]
+        target_today: { type: number, nullable: true }
+        horizon_date: { type: string, format: date, nullable: true }
+        priority: { type: integer }
+        inflation_rate: { type: number }
+        target_future_value: { type: number, nullable: true }
+        confidence_tag:
+          type: string
+          enum: [high, medium, low]
+        equity_band_low: { type: number }
+        equity_band_high: { type: number }
+        glide_start_date: { type: string, format: date, nullable: true }
+        is_perpetual: { type: boolean, description: "True => no completion/on-track status, policy-band only." }
+
+    AssumptionInput:
+      type: object
+      required: [key, value]
+      properties:
+        key:
+          type: string
+          description: "e.g. inflation.education, mu.equity, sigma.smallcap, band.7_10y.high"
+        value: { type: number }
+
+    Assumption:
+      allOf:
+        - $ref: '#/components/schemas/AssumptionInput'
+        - type: object
+          properties:
+            is_default: { type: boolean, description: "False once the user edits it." }
+
+    Earmark:
+      type: object
+      description: A tracking allocation (NOT ownership/segregation).
+      properties:
+        id: { type: string }
+        holding_id: { type: string }
+        goal_id:
+          type: string
+          nullable: true
+          description: "Null means the Unallocated bucket."
+        percentage: { type: number }
+        amount: { type: number }
+        locked_by_user: { type: boolean }
+        reasoning_object_id: { type: string }
+
+    ReasoningObject:
+      type: object
+      description: The spine of "every action has a why". Rendered by the UI, retrieved by the chatbot.
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum: [earmark, flag, sufficiency, path_safety, portfolio_health]
+        subject_ref: { type: string, description: "goal_id | holding_id | earmark_id | 'portfolio'" }
+        rule_id: { type: string, description: "Which deterministic rule fired." }
+        inputs_used:
+          type: object
+          additionalProperties: true
+          description: "Exact numbers/assumptions used."
+        assumptions_referenced:
+          type: array
+          items: { type: string }
+        plain_language: { type: string, description: "Descriptive, never prescriptive." }
+
+    StressResult:
+      type: object
+      properties:
+        scenario:
+          type: string
+          enum: [moderate, severe, gfc_2008, covid]
+        equity_shock: { type: number, description: "e.g. -0.35" }
+        resulting_value: { type: number }
+        breaks_goal: { type: boolean }
+
+    StructuralFlag:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - band_mismatch
+            - lock_conflict
+            - over_funding
+            - concentration_style
+            - concentration_amc
+            - concentration_sector
+            - emergency_inadequate
+            - fragmentation
+            - no_safe_assets
+        severity:
+          type: string
+          enum: [info, warn, critical]
+        plain_language: { type: string }
+        reasoning_object_id: { type: string }
+
+    Diagnosis:
+      type: object
+      properties:
+        goal_id: { type: string }
+        sufficiency:
+          type: object
+          nullable: true
+          description: "Null for perpetual goals (no completion concept)."
+          properties:
+            p10: { type: number }
+            p50: { type: number }
+            p90: { type: number }
+            target_future_value: { type: number }
+            verdict:
+              type: string
+              enum: [on_track, behind, ahead, not_assured]
+            judged_against:
+              type: string
+              enum: [p10, p50]
+              description: "Essential goals judged vs p10; aspirational vs p50."
+            illustrative_note:
+              type: string
+              description: "Always present: 'illustrative scenarios, not predictions'."
+        path_safety:
+          type: object
+          properties:
+            fragility:
+              type: string
+              enum: [low, moderate, high]
+            scenarios:
+              type: array
+              items: { $ref: '#/components/schemas/StressResult' }
+        structural_flags:
+          type: array
+          items: { $ref: '#/components/schemas/StructuralFlag' }
+
+    PortfolioHealth:
+      type: object
+      description: Layer 0 — rendered ABOVE all goal-level output.
+      properties:
+        emergency_reserve_adequate: { type: boolean }
+        aggregate_mix:
+          type: object
+          properties:
+            equity: { type: number }
+            debt: { type: number }
+            liquid: { type: number }
+        concentration:
+          type: object
+          properties:
+            style: { type: array, items: { $ref: '#/components/schemas/StructuralFlag' } }
+            amc: { type: array, items: { $ref: '#/components/schemas/StructuralFlag' } }
+            sector: { type: array, items: { $ref: '#/components/schemas/StructuralFlag' } }
+        liquidity_posture: { type: string }
+        summary_line: { type: string, description: "Blunt one-liner, e.g. 'No emergency reserve | 100% equity'." }
+        flags:
+          type: array
+          items: { $ref: '#/components/schemas/StructuralFlag' }
+
+    GoalView:
+      type: object
+      description: One goal with its earmarks and diagnosis, for rendering.
+      properties:
+        goal: { $ref: '#/components/schemas/Goal' }
+        earmarks:
+          type: array
+          items: { $ref: '#/components/schemas/Earmark' }
+        diagnosis: { $ref: '#/components/schemas/Diagnosis' }
+        resulting_equity_fraction: { type: number }
+
+    DashboardState:
+      type: object
+      description: The complete computed snapshot returned by /engine/run and GET /dashboard.
+      properties:
+        computed_at: { type: string, format: date-time }
+        portfolio_health: { $ref: '#/components/schemas/PortfolioHealth' }
+        goals:
+          type: array
+          items: { $ref: '#/components/schemas/GoalView' }
+        unallocated:
+          type: object
+          properties:
+            total_value: { type: number }
+            earmarks:
+              type: array
+              items: { $ref: '#/components/schemas/Earmark' }
+        reasoning_objects:
+          type: array
+          items: { $ref: '#/components/schemas/ReasoningObject' }
+        data_freshness:
+          type: object
+          properties:
+            last_cas_upload: { type: string, format: date-time, nullable: true }
+            last_nav_date: { type: string, format: date }
+            nudge_due: { type: boolean }
+            nudge_reason: { type: string, nullable: true }
+
+    ChatResponse:
+      type: object
+      properties:
+        answer: { type: string }
+        in_scope: { type: boolean }
+        refused: { type: boolean, description: "True when out-of-scope; answer is a polite redirect." }
+        referenced_reasoning_object_ids:
+          type: array
+          items: { type: string }
+        not_computed:
+          type: boolean
+          description: "True when the question is in-scope but the engine has no computed answer."

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+.venv39/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Alembic
+# (keep versions/ checked in)
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Uploaded PDFs (never check in real CAS files)
+*.pdf
+
+# Temp
+*.tmp
+*.log
